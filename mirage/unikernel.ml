@@ -1,6 +1,4 @@
 open Cmdliner
-open Lwt.Infix
-
 let port =
   let doc = Arg.info ~doc:"Port of the TimeCapsule HTTP service." [ "p"; "port" ] in
   Arg.(value & opt int 8080 doc)
