@@ -1,8 +1,4 @@
-open Timecapsule_core
-
-module Time_capsule = Time_capsule
-
-open Time_capsule
+open Timecapsule_core.Time_capsule
 
 let check_i64 label expected actual =
   Alcotest.(check string) label (Int64.to_string expected) (Int64.to_string actual)
