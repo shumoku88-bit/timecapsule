@@ -1,22 +1,27 @@
-# MirageOS clock boundary
+# MirageOS runtime boundary
 
-This adapter exists to establish one narrow runtime property:
+The MirageOS adapter connects the pure TimeCapsule state machine to two runtime
+resources:
 
-> a client may choose a deadline, but it may not supply the authoritative
-> `now` used by `Release`.
+- a wall-clock observation from `Mirage_ptime.now ()`;
+- a Chamelon key/value store backed by the `capsule` block image.
 
-The HTTP surface is deliberately small:
+The HTTP surface remains deliberately small:
 
 - `GET /state`
 - `POST /seal?deadline=<unix-seconds>`
 - `POST /release`
 
-`POST /release` obtains its observation from `Mirage_ptime.now ()` inside the
-unikernel, converts it to integer Unix seconds, and passes that value into the
-pure core.
+A client may choose a deadline, but it may not supply the authoritative `now`
+used by `Release`.
 
-The adapter is intentionally volatile in this milestone. Restarting it resets
-the capsule to `Unsealed`.
+State-changing operations are persisted before their new state is published to
+the running service. The adapter stores exactly one snapshot at `/capsule`.
 
-No claim is made here that the wall clock is correct, monotonic, authenticated,
-or resistant to a malicious host or hypervisor.
+See `docs/CLOCK_BOUNDARY.md` and `docs/PERSISTENCE.md` for the exact claim
+boundaries.
+
+No claim is made that the wall clock is correct, monotonic, authenticated, or
+resistant to a malicious host or hypervisor. The current persistence evidence
+covers tested Unix process restart with the same backing image, not host
+power-loss durability.
