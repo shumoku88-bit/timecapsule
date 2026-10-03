@@ -1,0 +1,20 @@
+opam-version: "2.0"
+version: "0.0.0"
+synopsis: "Tiny inspectable time-state experiments"
+description: """
+TimeCapsule explores small single-purpose time state machines in OCaml, with
+formal models and MirageOS runtime experiments added only after the pure
+semantics are established.
+"""
+maintainer: "TimeCapsule maintainers"
+depends: [
+  "ocaml" {>= "5.2.0"}
+  "dune" {>= "3.17"}
+  "alcotest" {with-test}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
+run-test: [
+  ["dune" "runtest" "-p" name "-j" jobs]
+]
