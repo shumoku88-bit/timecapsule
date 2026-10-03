@@ -1,12 +1,28 @@
 open Cmdliner
+open Lwt.Infix
+
 let port =
   let doc = Arg.info ~doc:"Port of the TimeCapsule HTTP service." [ "p"; "port" ] in
   Arg.(value & opt int 8080 doc)
 
-module Make (HTTP_server : Paf_mirage.S with type ipaddr = Ipaddr.t) = struct
-  module Capsule = Timecapsule_core.Time_capsule
+let program_block_size =
+  let doc =
+    Arg.info
+      ~doc:"Program block size used by the Chamelon persistent store."
+      [ "program-block-size" ]
+  in
+  Arg.(value & opt int 16 doc)
 
+module Make
+    (HTTP_server : Paf_mirage.S with type ipaddr = Ipaddr.t)
+    (Store : Mirage_kv.RW) =
+struct
+  module Capsule = Timecapsule_core.Time_capsule
+  module Snapshot = Timecapsule_core.Snapshot
+
+  let capsule_key = Mirage_kv.Key.v "/capsule"
   let current = ref Capsule.Unsealed
+  let blocked = ref false
   let mutation_lock = Lwt_mutex.create ()
 
   let timestamp_now () =
@@ -58,15 +74,37 @@ module Make (HTTP_server : Paf_mirage.S with type ipaddr = Ipaddr.t) = struct
     let response = H1.Response.create ~headers status in
     H1.Reqd.respond_with_string reqd response body
 
-  let apply reqd command =
+  let json_storage_error () =
+    {|{"error":"storage_unavailable"}
+|}
+
+  let fail_storage reqd message =
+    blocked := true;
+    Logs.err (fun log -> log "%s" message);
+    respond reqd `Internal_server_error (json_storage_error ())
+
+  let commit store state =
+    Store.set store capsule_key (Snapshot.encode state)
+
+  let apply store reqd command =
     match Capsule.step !current command with
     | Capsule.Applied state ->
-        current := state;
-        respond reqd `OK (state_json state)
+        commit store state >>= (function
+          | Ok () ->
+              current := state;
+              respond reqd `OK (state_json state);
+              Lwt.return_unit
+          | Error error ->
+              fail_storage reqd
+                (Fmt.str "persistent commit failed: %a"
+                   Store.pp_write_error error);
+              Lwt.return_unit)
     | Capsule.Unchanged state ->
-        respond reqd `OK (state_json state)
+        respond reqd `OK (state_json state);
+        Lwt.return_unit
     | Capsule.Refused refusal ->
-        respond reqd `Conflict (refusal_json refusal)
+        respond reqd `Conflict (refusal_json refusal);
+        Lwt.return_unit
 
   let parse_deadline target =
     let prefix = "/seal?deadline=" in
@@ -82,39 +120,69 @@ module Make (HTTP_server : Paf_mirage.S with type ipaddr = Ipaddr.t) = struct
       if String.contains raw '&' then None
       else Int64.of_string_opt raw
 
-  let request_handler _flow (_ipaddr, _port) reqd =
+  let request_handler store _flow (_ipaddr, _port) reqd =
     let request = H1.Reqd.request reqd in
     H1.Body.Reader.close (H1.Reqd.request_body reqd);
-    match request.H1.Request.meth, request.H1.Request.target with
-    | `GET, "/state" ->
-        respond reqd `OK (state_json !current)
-    | `POST, target when String.starts_with ~prefix:"/seal?deadline=" target ->
-        (match parse_deadline target with
-         | None ->
-             respond reqd `Bad_request {|{"error":"invalid_deadline"}
+    if !blocked then
+      respond reqd `Internal_server_error (json_storage_error ())
+    else
+      match request.H1.Request.meth, request.H1.Request.target with
+      | `GET, "/state" ->
+          respond reqd `OK (state_json !current)
+      | `POST, target when String.starts_with ~prefix:"/seal?deadline=" target ->
+          (match parse_deadline target with
+           | None ->
+               respond reqd `Bad_request {|{"error":"invalid_deadline"}
 |}
-         | Some deadline ->
-             Lwt.async (fun () ->
-               Lwt_mutex.with_lock mutation_lock (fun () ->
-                 apply reqd (Capsule.Seal deadline);
-                 Lwt.return_unit)))
-    | `POST, "/release" ->
-        Lwt.async (fun () ->
-          Lwt_mutex.with_lock mutation_lock (fun () ->
-            let observed_at = timestamp_now () in
-            apply reqd (Capsule.Release observed_at);
-            Lwt.return_unit))
-    | _ ->
-        respond reqd `Not_found {|{"error":"not_found"}
+           | Some deadline ->
+               Lwt.async (fun () ->
+                 Lwt_mutex.with_lock mutation_lock (fun () ->
+                   apply store reqd (Capsule.Seal deadline))))
+      | `POST, "/release" ->
+          Lwt.async (fun () ->
+            Lwt_mutex.with_lock mutation_lock (fun () ->
+              let observed_at = timestamp_now () in
+              apply store reqd (Capsule.Release observed_at)))
+      | _ ->
+          respond reqd `Not_found {|{"error":"not_found"}
 |}
 
   let error_handler (_ipaddr, _port) ?request:_ _error _send = ()
 
-  let start http_server =
+  let load store =
+    Store.get store capsule_key >>= function
+    | Ok payload ->
+        (match Snapshot.decode payload with
+         | Ok state ->
+             Logs.info (fun log -> log "restored durable TimeCapsule state");
+             Lwt.return state
+         | Error error ->
+             let message =
+               Printf.sprintf "invalid persisted capsule snapshot: %s" error
+             in
+             Logs.err (fun log -> log "%s" message);
+             Lwt.fail_with message)
+    | Error (`Not_found _) ->
+        let state = Capsule.Unsealed in
+        commit store state >>= (function
+          | Ok () ->
+              Logs.info (fun log -> log "initialized fresh durable TimeCapsule");
+              Lwt.return state
+          | Error error ->
+              Lwt.fail_with
+                (Fmt.str "initial persistent commit failed: %a"
+                   Store.pp_write_error error))
+    | Error error ->
+        Lwt.fail_with
+          (Fmt.str "persistent load failed: %a" Store.pp_error error)
+
+  let start http_server store =
+    load store >>= fun state ->
+    current := state;
     let service =
       HTTP_server.http_service
         ~error_handler
-        request_handler
+        (request_handler store)
     in
     let (`Initialized thread) = Paf.serve service http_server in
     thread

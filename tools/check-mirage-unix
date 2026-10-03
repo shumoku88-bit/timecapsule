@@ -6,6 +6,7 @@ cd "$repo_root"
 
 port=18080
 base="http://127.0.0.1:$port"
+image="$repo_root/capsule"
 log="$(mktemp)"
 state_file="$(mktemp)"
 pid=""
@@ -15,7 +16,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
-  rm -f "$log" "$state_file"
+  rm -f "$log" "$state_file" "$image"
 }
 trap cleanup EXIT
 
@@ -53,8 +54,19 @@ start_service() {
   fi
 }
 
+assert_json_equal() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+actual = json.loads(sys.argv[1])
+expected = json.loads(sys.argv[2])
+assert actual == expected, (actual, expected)
+PY
+}
+
 opam install .
-opam install mirage.4.11.2
+opam install mirage.4.11.2 chamelon-unix
 
 (
   cd mirage
@@ -63,40 +75,23 @@ opam install mirage.4.11.2
   opam exec -- dune build
 )
 
+bash tools/create-capsule-image "$image"
 start_service
 
 initial="$(cat "$state_file")"
-if [[ "$initial" != '{"state":"unsealed"}' ]]; then
-  echo "unexpected initial response: $initial" >&2
-  exit 1
-fi
-
-not_sealed_file="$(mktemp)"
-not_sealed_status="$(
-  curl --silent --show-error -o "$not_sealed_file" -w '%{http_code}'     -X POST "$base/release"
-)"
-not_sealed="$(cat "$not_sealed_file")"
-rm -f "$not_sealed_file"
-
-if [[ "$not_sealed_status" != "409" ]] ||
-   [[ "$not_sealed" != '{"error":"not_sealed"}' ]]; then
-  echo "unexpected release-before-seal response: $not_sealed_status $not_sealed" >&2
-  exit 1
-fi
+assert_json_equal "$initial" '{"state":"unsealed"}'
 
 future=4102444800
 waiting="$(
   curl --silent --show-error -X POST "$base/seal?deadline=$future"
 )"
-python3 - "$waiting" "$future" <<'PY'
-import json
-import sys
+assert_json_equal "$waiting" "{"state":"waiting","deadline":$future}"
 
-payload = json.loads(sys.argv[1])
-future = int(sys.argv[2])
+stop_service
+start_service
 
-assert payload == {"state": "waiting", "deadline": future}, payload
-PY
+waiting_after_reboot="$(cat "$state_file")"
+assert_json_equal "$waiting_after_reboot" "{"state":"waiting","deadline":$future}"
 
 too_early_file="$(mktemp)"
 too_early_status="$(
@@ -123,19 +118,13 @@ assert 0 < payload["observed_at"] < future, payload
 PY
 
 stop_service
+bash tools/create-capsule-image "$image"
 start_service
 
-released_zero="$(
+zero_waiting="$(
   curl --silent --show-error -X POST "$base/seal?deadline=0"
 )"
-python3 - "$released_zero" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-
-assert payload == {"state": "waiting", "deadline": 0}, payload
-PY
+assert_json_equal "$zero_waiting" '{"state":"waiting","deadline":0}'
 
 released="$(
   curl --silent --show-error -X POST "$base/release"
@@ -146,25 +135,47 @@ import json
 import sys
 
 payload = json.loads(sys.argv[1])
-
 assert payload["state"] == "released", payload
 assert payload["deadline"] == 0, payload
 assert payload["released_at"] > 0, payload
 PY
 
-state="$(
-  curl --silent --show-error "$base/state"
+stop_service
+start_service
+
+released_after_reboot="$(cat "$state_file")"
+assert_json_equal "$released_after_reboot" "$released"
+
+released_again="$(
+  curl --silent --show-error -X POST "$base/release"
 )"
-if [[ "$state" != "$released" ]]; then
-  echo "released state was not latched in the running unikernel" >&2
-  echo "release: $released" >&2
-  echo "state:   $state" >&2
-  exit 1
-fi
+assert_json_equal "$released_again" "$released"
 
 if curl --silent --show-error --fail -X POST "$base/release?now=0" >/dev/null 2>&1; then
   echo "release endpoint unexpectedly accepted a client-supplied now parameter" >&2
   exit 1
 fi
 
-echo "MirageOS Unix clock-boundary smoke test: OK"
+stop_service
+opam exec -- chamelon write "$image" 512 /capsule corrupt
+
+: >"$log"
+mirage/dist/timecapsule-http --port "$port" >"$log" 2>&1 &
+pid=$!
+sleep 1
+
+if kill -0 "$pid" 2>/dev/null; then
+  echo "service accepted a malformed persisted snapshot" >&2
+  cat "$log" >&2
+  exit 1
+fi
+wait "$pid" 2>/dev/null || true
+pid=""
+
+if ! grep -q "invalid persisted capsule snapshot" "$log"; then
+  echo "service failed closed, but not for the expected snapshot validation reason" >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+echo "MirageOS Unix durable TimeCapsule smoke test: OK"
