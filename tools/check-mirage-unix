@@ -85,13 +85,29 @@ future=4102444800
 waiting="$(
   curl --silent --show-error -X POST "$base/seal?deadline=$future"
 )"
-assert_json_equal "$waiting" "{"state":"waiting","deadline":$future}"
+python3 - "$waiting" "$future" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+deadline = int(sys.argv[2])
+
+assert payload == {"state": "waiting", "deadline": deadline}, payload
+PY
 
 stop_service
 start_service
 
 waiting_after_reboot="$(cat "$state_file")"
-assert_json_equal "$waiting_after_reboot" "{"state":"waiting","deadline":$future}"
+python3 - "$waiting_after_reboot" "$future" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+deadline = int(sys.argv[2])
+
+assert payload == {"state": "waiting", "deadline": deadline}, payload
+PY
 
 too_early_file="$(mktemp)"
 too_early_status="$(
