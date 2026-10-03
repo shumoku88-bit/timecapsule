@@ -88,10 +88,15 @@ future=4102444800
 waiting="$(
   curl --silent --show-error -X POST "$base/seal?deadline=$future"
 )"
-if [[ "$waiting" != "{"state":"waiting","deadline":$future}" ]]; then
-  echo "unexpected future seal response: $waiting" >&2
-  exit 1
-fi
+python3 - "$waiting" "$future" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+future = int(sys.argv[2])
+
+assert payload == {"state": "waiting", "deadline": future}, payload
+PY
 
 too_early_file="$(mktemp)"
 too_early_status="$(
@@ -123,10 +128,14 @@ start_service
 released_zero="$(
   curl --silent --show-error -X POST "$base/seal?deadline=0"
 )"
-if [[ "$released_zero" != '{"state":"waiting","deadline":0}' ]]; then
-  echo "unexpected zero-deadline seal response: $released_zero" >&2
-  exit 1
-fi
+python3 - "$released_zero" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+
+assert payload == {"state": "waiting", "deadline": 0}, payload
+PY
 
 released="$(
   curl --silent --show-error -X POST "$base/release"
