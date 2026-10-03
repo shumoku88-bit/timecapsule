@@ -1,3 +1,7 @@
+open Timecapsule_core
+
+module Time_capsule = Time_capsule
+
 open Time_capsule
 
 let check_i64 label expected actual =
