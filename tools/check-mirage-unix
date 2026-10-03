@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+port=18080
+base="http://127.0.0.1:$port"
+log="$(mktemp)"
+state_file="$(mktemp)"
+pid=""
+
+cleanup() {
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$log" "$state_file"
+}
+trap cleanup EXIT
+
+stop_service() {
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pid=""
+  fi
+}
+
+start_service() {
+  : >"$log"
+  mirage/dist/timecapsule-http --port "$port" >"$log" 2>&1 &
+  pid=$!
+
+  local ready=false
+  for _ in $(seq 1 60); do
+    if curl --silent --show-error "$base/state" >"$state_file" 2>/dev/null; then
+      ready=true
+      break
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "MirageOS HTTP service exited before becoming ready" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+    sleep 0.25
+  done
+
+  if [[ "$ready" != "true" ]]; then
+    echo "MirageOS HTTP service did not become ready" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+opam install .
+opam install mirage.4.11.2
+
+(
+  cd mirage
+  opam exec -- mirage configure -t unix --net socket
+  opam exec -- make depends
+  opam exec -- dune build
+)
+
+start_service
+
+initial="$(cat "$state_file")"
+if [[ "$initial" != '{"state":"unsealed"}' ]]; then
+  echo "unexpected initial response: $initial" >&2
+  exit 1
+fi
+
+not_sealed_file="$(mktemp)"
+not_sealed_status="$(
+  curl --silent --show-error -o "$not_sealed_file" -w '%{http_code}'     -X POST "$base/release"
+)"
+not_sealed="$(cat "$not_sealed_file")"
+rm -f "$not_sealed_file"
+
+if [[ "$not_sealed_status" != "409" ]] ||
+   [[ "$not_sealed" != '{"error":"not_sealed"}' ]]; then
+  echo "unexpected release-before-seal response: $not_sealed_status $not_sealed" >&2
+  exit 1
+fi
+
+future=4102444800
+waiting="$(
+  curl --silent --show-error -X POST "$base/seal?deadline=$future"
+)"
+python3 - "$waiting" "$future" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+future = int(sys.argv[2])
+
+assert payload == {"state": "waiting", "deadline": future}, payload
+PY
+
+too_early_file="$(mktemp)"
+too_early_status="$(
+  curl --silent --show-error -o "$too_early_file" -w '%{http_code}'     -X POST "$base/release"
+)"
+too_early="$(cat "$too_early_file")"
+rm -f "$too_early_file"
+
+if [[ "$too_early_status" != "409" ]]; then
+  echo "release before future deadline unexpectedly succeeded: $too_early_status $too_early" >&2
+  exit 1
+fi
+
+python3 - "$too_early" "$future" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+future = int(sys.argv[2])
+
+assert payload["error"] == "too_early", payload
+assert payload["deadline"] == future, payload
+assert 0 < payload["observed_at"] < future, payload
+PY
+
+stop_service
+start_service
+
+released_zero="$(
+  curl --silent --show-error -X POST "$base/seal?deadline=0"
+)"
+python3 - "$released_zero" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+
+assert payload == {"state": "waiting", "deadline": 0}, payload
+PY
+
+released="$(
+  curl --silent --show-error -X POST "$base/release"
+)"
+
+python3 - "$released" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+
+assert payload["state"] == "released", payload
+assert payload["deadline"] == 0, payload
+assert payload["released_at"] > 0, payload
+PY
+
+state="$(
+  curl --silent --show-error "$base/state"
+)"
+if [[ "$state" != "$released" ]]; then
+  echo "released state was not latched in the running unikernel" >&2
+  echo "release: $released" >&2
+  echo "state:   $state" >&2
+  exit 1
+fi
+
+if curl --silent --show-error --fail -X POST "$base/release?now=0" >/dev/null 2>&1; then
+  echo "release endpoint unexpectedly accepted a client-supplied now parameter" >&2
+  exit 1
+fi
+
+echo "MirageOS Unix clock-boundary smoke test: OK"
