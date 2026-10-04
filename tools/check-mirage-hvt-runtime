@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+bridge="tcbr0"
+tap="tctap0"
+host_ip="10.78.0.1"
+guest_ip="10.78.0.2"
+prefix="24"
+port="18082"
+base="http://$guest_ip:$port"
+log="$(mktemp)"
+state_file="$(mktemp)"
+image="$(mktemp)"
+release_output="$(mktemp)"
+pid=""
+curl_pid=""
+
+cleanup() {
+  if [[ -n "$curl_pid" ]]; then
+    kill "$curl_pid" 2>/dev/null || true
+    wait "$curl_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  sudo ip link del "$bridge" 2>/dev/null || true
+  sudo ip link del "$tap" 2>/dev/null || true
+  rm -f "$log" "$state_file" "$release_output" "$image"
+}
+trap cleanup EXIT
+
+stop_guest() {
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pid=""
+  fi
+}
+
+fresh_image() {
+  stop_guest
+  bash tools/create-capsule-image "$image"
+}
+
+start_guest() {
+  local failure_point="${1:-none}"
+  : >"$log"
+
+  opam exec -- solo5-hvt     --mem=64     --net:service="$tap"     --block:capsule="$image"     -- "$artifact"     --ipv4="$guest_ip/$prefix"     --ipv4-gateway="$host_ip"     --port "$port"     --failure-point "$failure_point"     >"$log" 2>&1 &
+  pid=$!
+
+  local ready=false
+  for _ in $(seq 1 80); do
+    if curl --noproxy '*' --silent --show-error --connect-timeout 1       "$base/state" >"$state_file" 2>/dev/null; then
+      ready=true
+      break
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "hvt unikernel exited before becoming ready" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+
+    sleep 0.25
+  done
+
+  if [[ "$ready" != "true" ]]; then
+    echo "hvt unikernel did not become ready" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+wait_for_failpoint() {
+  local expected="$1"
+  local marker="TIMECAPSULE_FAILPOINT $expected"
+
+  for _ in $(seq 1 80); do
+    if grep -q "$marker" "$log"; then
+      return 0
+    fi
+
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "hvt guest exited before failpoint $expected" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+
+    sleep 0.25
+  done
+
+  echo "did not observe failpoint $expected" >&2
+  cat "$log" >&2
+  exit 1
+}
+
+assert_waiting_zero() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+assert payload == {"state": "waiting", "deadline": 0}, payload
+PY
+}
+
+assert_released_zero() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+assert payload["state"] == "released", payload
+assert payload["deadline"] == 0, payload
+assert payload["released_at"] >= 0, payload
+PY
+}
+
+prepare_waiting_zero() {
+  fresh_image
+  start_guest none
+
+  local response
+  response="$(
+    curl --noproxy '*' --silent --show-error       -X POST "$base/seal?deadline=0"
+  )"
+  assert_waiting_zero "$response"
+  stop_guest
+}
+
+release_in_background() {
+  : >"$release_output"
+  curl --noproxy '*' --silent --show-error --max-time 20     -X POST "$base/release"     >"$release_output" 2>/dev/null &
+  curl_pid=$!
+}
+
+finish_background_release() {
+  if [[ -n "$curl_pid" ]]; then
+    wait "$curl_pid" 2>/dev/null || true
+    curl_pid=""
+  fi
+}
+
+if [[ ! -e /dev/kvm ]]; then
+  echo "/dev/kvm is unavailable; hvt runtime cannot be qualified on this runner" >&2
+  exit 1
+fi
+
+sudo chmod a+rw /dev/kvm
+
+bash tools/build-mirage-hvt
+opam install chamelon-unix
+
+sudo ip link add name "$bridge" type bridge
+sudo ip addr add "$host_ip/$prefix" dev "$bridge"
+sudo ip tuntap add dev "$tap" mode tap user "$(id -u)"
+sudo ip link set "$tap" master "$bridge"
+sudo ip link set "$tap" up
+sudo ip link set "$bridge" up
+
+artifact="mirage/dist/timecapsule-http.hvt"
+
+# Ordinary reboot continuity.
+prepare_waiting_zero
+start_guest none
+assert_waiting_zero "$(cat "$state_file")"
+
+released="$(
+  curl --noproxy '*' --silent --show-error     -X POST "$base/release"
+)"
+assert_released_zero "$released"
+
+stop_guest
+start_guest none
+released_after_reboot="$(cat "$state_file")"
+
+python3 - "$released" "$released_after_reboot" <<'PY'
+import json
+import sys
+
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+assert after == before, (before, after)
+PY
+stop_guest
+
+# Crash before Store.set: release must disappear.
+prepare_waiting_zero
+start_guest before-commit
+assert_waiting_zero "$(cat "$state_file")"
+
+release_in_background
+wait_for_failpoint before-commit
+stop_guest
+finish_background_release
+
+start_guest none
+before_recovery="$(cat "$state_file")"
+assert_waiting_zero "$before_recovery"
+
+before_retry="$(
+  curl --noproxy '*' --silent --show-error     -X POST "$base/release"
+)"
+assert_released_zero "$before_retry"
+stop_guest
+
+# Crash after Store.set Ok but before publication: release must recover.
+prepare_waiting_zero
+start_guest after-commit-before-publish
+assert_waiting_zero "$(cat "$state_file")"
+
+release_in_background
+wait_for_failpoint after-commit-before-publish
+stop_guest
+finish_background_release
+
+start_guest none
+after_recovery="$(cat "$state_file")"
+assert_released_zero "$after_recovery"
+
+after_retry="$(
+  curl --noproxy '*' --silent --show-error     -X POST "$base/release"
+)"
+
+python3 - "$after_recovery" "$after_retry" <<'PY'
+import json
+import sys
+
+recovered = json.loads(sys.argv[1])
+retried = json.loads(sys.argv[2])
+assert retried == recovered, (recovered, retried)
+PY
+
+echo "Solo5 hvt TimeCapsule reboot/crash-boundary smoke test: OK"

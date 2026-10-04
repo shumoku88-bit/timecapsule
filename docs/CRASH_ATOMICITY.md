@@ -19,14 +19,9 @@ publish visible state
 
 ## Abstract model
 
-The bounded TLA+ crash-recovery model checks that:
-
-- visible state never advances ahead of durable state;
-- idle state agrees with durable state;
-- a prepared state is not yet visible;
-- a committed state is already durable;
-- a visible `Released` state implies durable `Released`;
-- once durable state reaches `Released`, it never regresses.
+The bounded TLA+ crash-recovery model checks that visible state never advances
+ahead of durable state, recovery restores durable state, and durable
+`Released` never regresses.
 
 The negative control deliberately publishes `Released` before committing it.
 A crash in that gap recovers the old durable `Waiting` state, and TLC is
@@ -34,39 +29,27 @@ required to expose that rollback.
 
 ## Runtime crash injection
 
-The MirageOS Unix adapter also exposes a test-only `--failure-point` argument.
-Its default is `none`. Two values pause an `Applied` mutation at concrete
-application/KV boundaries:
+The MirageOS adapter exposes a test-only `--failure-point` argument whose
+default is `none`:
 
 - `before-commit`: immediately before `Store.set /capsule`;
 - `after-commit-before-publish`: after `Store.set` returns `Ok ()`, before
-  updating the in-memory state or sending the HTTP response.
+  updating in-memory state or sending the HTTP response.
 
-The runtime harness first persists `Waiting(0)`, then exercises `Release`.
+Both the Unix harness and the Solo5 hvt harness persist `Waiting(0)`, trigger
+`Release`, kill the runtime at each boundary, and restart from the same
+backing image.
 
-For `before-commit`, it kills the Unix unikernel while paused and reboots on
-the same backing image. Recovery must still be `Waiting(0)`. Retrying
-`Release` then succeeds normally.
+The required recovery behavior is:
 
-For `after-commit-before-publish`, it kills the unikernel after the durable
-write returned successfully but before publication. Recovery must be
-`Released(0, released_at)`, and retrying `Release` must preserve the same
-latched `released_at`.
+- before commit -> `Waiting(0)`;
+- after commit but before publish -> `Released(0, released_at)`;
+- retry after recovered `Released` preserves the same `released_at`.
 
-This runtime evidence connects the abstract ordering model to the concrete
-TimeCapsule application/KV commit boundary.
+See `HVT_RUNTIME.md` for the hvt-specific evidence boundary.
 
 ## Claim boundary
 
-The runtime test establishes process-kill/restart behavior for the tested
-MirageOS Unix + Chamelon path at these two injected boundaries.
-
-It does not establish:
-
-- host power-loss durability;
-- loss of host page cache;
-- storage-controller cache loss;
-- arbitrary torn host writes;
-- one-for-one correspondence between Chamelon internals and TLA+ steps;
-- Solo5 hvt crash-boundary behavior;
-- correctness or trustworthiness of the wall clock.
+The runtime tests exercise concrete application/KV boundaries. They do not
+establish host power-loss durability, arbitrary torn host writes, or
+one-for-one correspondence between Chamelon internals and TLA+ steps.
