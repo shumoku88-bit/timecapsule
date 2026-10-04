@@ -30,7 +30,7 @@ publish next_state and HTTP success
 the authoritative state.
 
 Unlike StateCapsule, TimeCapsule has no request-id or receipt history. Its
-commands are shaped to make safe retries idempotent.
+commands are shaped so safe retries do not need a separate replay ledger.
 
 ## Snapshot validation
 
@@ -48,20 +48,22 @@ The checksum detects accidental corruption. It is not authentication.
 
 ## Evidence
 
-The MirageOS Unix persistence test establishes that, using the same Chamelon
-backing image:
+Using the same Chamelon backing image, the repository tests establish:
 
-- `Waiting(deadline)` survives process restart;
-- `Released(deadline, released_at)` survives process restart;
-- a repeated release after restart preserves the original `released_at`;
-- a corrupt persisted snapshot causes fail-closed startup.
+- `Waiting(deadline)` survives MirageOS Unix process restart;
+- `Released(deadline, released_at)` survives restart;
+- repeated release preserves the original `released_at`;
+- corrupt persisted state causes fail-closed startup;
+- a kill immediately before `Store.set` recovers the previous durable state;
+- a kill after `Store.set` returns `Ok ()` but before publication recovers
+  the newly durable state;
+- Solo5 hvt guest restart exercises the same reboot and crash-boundary behavior.
 
-The separate crash-boundary test injects process kills immediately before
-`Store.set` and immediately after `Store.set` returns `Ok ()` but before
-publication. See `CRASH_ATOMICITY.md`.
+See `CRASH_ATOMICITY.md` and `HVT_RUNTIME.md` for the exact tested
+boundaries.
 
 ## Not established
 
-The current evidence does not establish host power-loss durability, arbitrary
-torn-write behavior, Solo5 hvt crash-boundary behavior, trustworthy wall-clock
-time, TLS, authentication, or authorization.
+The current evidence does not establish host power-loss durability, host kernel
+failure durability, arbitrary torn-write behavior, volatile cache-loss
+durability, trustworthy wall-clock time, TLS, authentication, or authorization.

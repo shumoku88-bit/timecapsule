@@ -17,11 +17,13 @@ The Unix smoke test exercises the clock boundary with both a far-future
 deadline and a deadline at zero. It also checks that
 `/release?now=0` is not an accepted release endpoint.
 
+Solo5 hvt runtime tests exercise the same adapter in a freestanding guest.
+
 ## What this establishes
 
-For the tested MirageOS Unix runtime, release decisions are driven by a clock
-observation obtained inside the unikernel rather than an authoritative
-timestamp supplied by the HTTP client.
+For the tested MirageOS Unix and Solo5 hvt runtime paths, release decisions are
+driven by a clock observation obtained inside the unikernel rather than an
+authoritative timestamp supplied by the HTTP client.
 
 Persistence of the resulting state is documented separately in
 `PERSISTENCE.md`.
@@ -33,5 +35,4 @@ This does not establish:
 - correctness of real-world wall time;
 - monotonicity of the wall clock;
 - resistance to host or hypervisor clock manipulation;
-- Solo5 hvt execution;
 - TLS, authentication, or authorization.
