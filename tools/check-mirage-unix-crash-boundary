@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+port=18081
+base="http://127.0.0.1:$port"
+image="$repo_root/capsule"
+log="$(mktemp)"
+state_file="$(mktemp)"
+release_output="$(mktemp)"
+pid=""
+curl_pid=""
+
+cleanup() {
+  if [[ -n "$curl_pid" ]]; then
+    kill "$curl_pid" 2>/dev/null || true
+    wait "$curl_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$log" "$state_file" "$release_output" "$image"
+}
+trap cleanup EXIT
+
+stop_service() {
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pid=""
+  fi
+}
+
+start_service() {
+  local failure_point="${1:-none}"
+  : >"$log"
+
+  mirage/dist/timecapsule-http     --port "$port"     --failure-point "$failure_point"     >"$log" 2>&1 &
+  pid=$!
+
+  local ready=false
+  for _ in $(seq 1 80); do
+    if curl --silent --show-error --connect-timeout 1       "$base/state" >"$state_file" 2>/dev/null; then
+      ready=true
+      break
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "MirageOS Unix service exited before becoming ready" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+
+    sleep 0.25
+  done
+
+  if [[ "$ready" != "true" ]]; then
+    echo "MirageOS Unix service did not become ready" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+wait_for_failpoint() {
+  local expected="$1"
+  local marker="TIMECAPSULE_FAILPOINT $expected"
+
+  for _ in $(seq 1 80); do
+    if grep -q "$marker" "$log"; then
+      return 0
+    fi
+
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "service exited before failpoint $expected" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+
+    sleep 0.25
+  done
+
+  echo "did not observe failpoint $expected" >&2
+  cat "$log" >&2
+  exit 1
+}
+
+assert_waiting_zero() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+assert payload == {"state": "waiting", "deadline": 0}, payload
+PY
+}
+
+assert_released_zero() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+assert payload["state"] == "released", payload
+assert payload["deadline"] == 0, payload
+assert payload["released_at"] > 0, payload
+PY
+}
+
+prepare_waiting_zero() {
+  bash tools/create-capsule-image "$image"
+  start_service none
+
+  local response
+  response="$(
+    curl --silent --show-error -X POST "$base/seal?deadline=0"
+  )"
+  assert_waiting_zero "$response"
+  stop_service
+}
+
+release_in_background() {
+  : >"$release_output"
+  curl --silent --show-error --max-time 20     -X POST "$base/release"     >"$release_output" 2>/dev/null &
+  curl_pid=$!
+}
+
+finish_background_release() {
+  if [[ -n "$curl_pid" ]]; then
+    wait "$curl_pid" 2>/dev/null || true
+    curl_pid=""
+  fi
+}
+
+opam install .
+opam install mirage.4.11.2 chamelon-unix
+
+(
+  cd mirage
+  opam exec -- mirage configure -t unix --net socket
+  opam exec -- make depends
+  opam exec -- dune build
+)
+
+# Crash before Store.set: the release candidate must disappear.
+prepare_waiting_zero
+start_service before-commit
+assert_waiting_zero "$(cat "$state_file")"
+
+release_in_background
+wait_for_failpoint before-commit
+stop_service
+finish_background_release
+
+start_service none
+before_recovery="$(cat "$state_file")"
+assert_waiting_zero "$before_recovery"
+
+before_retry="$(
+  curl --silent --show-error -X POST "$base/release"
+)"
+assert_released_zero "$before_retry"
+stop_service
+
+# Crash after Store.set returned Ok but before in-memory/HTTP publication:
+# reboot must recover the durable Released fact.
+prepare_waiting_zero
+start_service after-commit-before-publish
+assert_waiting_zero "$(cat "$state_file")"
+
+release_in_background
+wait_for_failpoint after-commit-before-publish
+stop_service
+finish_background_release
+
+start_service none
+after_recovery="$(cat "$state_file")"
+assert_released_zero "$after_recovery"
+
+after_retry="$(
+  curl --silent --show-error -X POST "$base/release"
+)"
+
+python3 - "$after_recovery" "$after_retry" <<'PY'
+import json
+import sys
+
+recovered = json.loads(sys.argv[1])
+retried = json.loads(sys.argv[2])
+assert retried == recovered, (recovered, retried)
+PY
+
+echo "MirageOS Unix crash-boundary smoke test: OK"
