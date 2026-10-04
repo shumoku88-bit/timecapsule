@@ -1,11 +1,11 @@
-# Persistence crash atomicity model
+# Persistence crash atomicity
 
 TimeCapsule has a smaller crash problem than StateCapsule.
 
 There is only one authoritative durable value: the capsule state. There is no
 separate request receipt that must be committed atomically with it.
 
-The model therefore focuses on one ordering rule:
+The required ordering is:
 
 ```text
 prepare next state
@@ -17,23 +17,9 @@ commit durable snapshot
 publish visible state
 ```
 
-A crash may occur before or after the durable commit.
+## Abstract model
 
-## Crash before commit
-
-If the process crashes while the next state is only prepared, recovery restores
-the previous durable state. No newer state was published.
-
-## Crash after commit, before publish
-
-If the durable snapshot has been committed but the new state has not yet been
-published, recovery restores the committed state. The client may have missed
-the response, but a retry is safe because TimeCapsule operations are
-idempotent.
-
-## Checked properties
-
-The bounded TLA+ model checks:
+The bounded TLA+ crash-recovery model checks that:
 
 - visible state never advances ahead of durable state;
 - idle state agrees with durable state;
@@ -42,34 +28,45 @@ The bounded TLA+ model checks:
 - a visible `Released` state implies durable `Released`;
 - once durable state reaches `Released`, it never regresses.
 
-The model abstracts timestamps away because the clock-ordering properties are
-already checked by `TimeCapsule.tla`. This model is specifically about
-publication and persistence ordering.
+The negative control deliberately publishes `Released` before committing it.
+A crash in that gap recovers the old durable `Waiting` state, and TLC is
+required to expose that rollback.
 
-## Negative control
+## Runtime crash injection
 
-`PublishBeforeCommitCounterexample.tla` deliberately reverses the important
-ordering:
+The MirageOS Unix adapter also exposes a test-only `--failure-point` argument.
+Its default is `none`. Two values pause an `Applied` mutation at concrete
+application/KV boundaries:
 
-```text
-prepare release
-      |
-      v
-publish Released
-      |
-      v
-commit durable Released
-```
+- `before-commit`: immediately before `Store.set /capsule`;
+- `after-commit-before-publish`: after `Store.set` returns `Ok ()`, before
+  updating the in-memory state or sending the HTTP response.
 
-It then crashes after publication but before commit. Recovery reads the old
-durable `Waiting` state, so an externally visible `Released` fact becomes
-`Waiting` again.
+The runtime harness first persists `Waiting(0)`, then exercises `Release`.
 
-CI requires TLC to find that counterexample.
+For `before-commit`, it kills the Unix unikernel while paused and reboots on
+the same backing image. Recovery must still be `Waiting(0)`. Retrying
+`Release` then succeeds normally.
+
+For `after-commit-before-publish`, it kills the unikernel after the durable
+write returned successfully but before publication. Recovery must be
+`Released(0, released_at)`, and retrying `Release` must preserve the same
+latched `released_at`.
+
+This runtime evidence connects the abstract ordering model to the concrete
+TimeCapsule application/KV commit boundary.
 
 ## Claim boundary
 
-This is a bounded abstract model. It does not establish that Chamelon,
-MirageOS, Solo5, the host kernel, or physical storage actually implements the
-abstract commit boundary atomically. Runtime crash injection is a separate
-milestone.
+The runtime test establishes process-kill/restart behavior for the tested
+MirageOS Unix + Chamelon path at these two injected boundaries.
+
+It does not establish:
+
+- host power-loss durability;
+- loss of host page cache;
+- storage-controller cache loss;
+- arbitrary torn host writes;
+- one-for-one correspondence between Chamelon internals and TLA+ steps;
+- Solo5 hvt crash-boundary behavior;
+- correctness or trustworthiness of the wall clock.

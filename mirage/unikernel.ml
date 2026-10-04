@@ -13,6 +13,17 @@ let program_block_size =
   in
   Arg.(value & opt int 16 doc)
 
+type failure_point =
+  | No_failure
+  | Before_commit
+  | After_commit_before_publish
+
+let failure_point =
+  let doc =
+    "TEST ONLY. Pause an applied mutation at a persistence boundary so an      external harness can kill the unikernel. Production/default value is none."
+  in
+  Arg.(value & opt string "none" & info ~doc [ "failure-point" ])
+
 module Make
     (HTTP_server : Paf_mirage.S with type ipaddr = Ipaddr.t)
     (Store : Mirage_kv.RW) =
@@ -24,6 +35,27 @@ struct
   let current = ref Capsule.Unsealed
   let blocked = ref false
   let mutation_lock = Lwt_mutex.create ()
+
+  let failure_point_to_string = function
+    | No_failure -> "none"
+    | Before_commit -> "before-commit"
+    | After_commit_before_publish -> "after-commit-before-publish"
+
+  let failure_point_of_string = function
+    | "none" -> Ok No_failure
+    | "before-commit" -> Ok Before_commit
+    | "after-commit-before-publish" -> Ok After_commit_before_publish
+    | value -> Error (Printf.sprintf "unknown failure point %S" value)
+
+  let pause_at configured expected =
+    if configured = expected then begin
+      Logs.warn (fun log ->
+        log "TIMECAPSULE_FAILPOINT %s"
+          (failure_point_to_string expected));
+      let forever, _wake = Lwt.wait () in
+      forever
+    end else
+      Lwt.return_unit
 
   let timestamp_now () =
     Mirage_ptime.now ()
@@ -86,11 +118,13 @@ struct
   let commit store state =
     Store.set store capsule_key (Snapshot.encode state)
 
-  let apply store reqd command =
+  let apply store failure_point reqd command =
     match Capsule.step !current command with
     | Capsule.Applied state ->
+        pause_at failure_point Before_commit >>= fun () ->
         commit store state >>= (function
           | Ok () ->
+              pause_at failure_point After_commit_before_publish >>= fun () ->
               current := state;
               respond reqd `OK (state_json state);
               Lwt.return_unit
@@ -120,7 +154,7 @@ struct
       if String.contains raw '&' then None
       else Int64.of_string_opt raw
 
-  let request_handler store _flow (_ipaddr, _port) reqd =
+  let request_handler store failure_point _flow (_ipaddr, _port) reqd =
     let request = H1.Reqd.request reqd in
     H1.Body.Reader.close (H1.Reqd.request_body reqd);
     if !blocked then
@@ -137,12 +171,12 @@ struct
            | Some deadline ->
                Lwt.async (fun () ->
                  Lwt_mutex.with_lock mutation_lock (fun () ->
-                   apply store reqd (Capsule.Seal deadline))))
+                   apply store failure_point reqd (Capsule.Seal deadline))))
       | `POST, "/release" ->
           Lwt.async (fun () ->
             Lwt_mutex.with_lock mutation_lock (fun () ->
               let observed_at = timestamp_now () in
-              apply store reqd (Capsule.Release observed_at)))
+              apply store failure_point reqd (Capsule.Release observed_at)))
       | _ ->
           respond reqd `Not_found {|{"error":"not_found"}
 |}
@@ -176,14 +210,18 @@ struct
         Lwt.fail_with
           (Fmt.str "persistent load failed: %a" Store.pp_error error)
 
-  let start http_server store =
-    load store >>= fun state ->
-    current := state;
-    let service =
-      HTTP_server.http_service
-        ~error_handler
-        (request_handler store)
-    in
-    let (`Initialized thread) = Paf.serve service http_server in
-    thread
+  let start http_server store failure_point_text =
+    match failure_point_of_string failure_point_text with
+    | Error error ->
+        Lwt.fail_with error
+    | Ok failure_point ->
+        load store >>= fun state ->
+        current := state;
+        let service =
+          HTTP_server.http_service
+            ~error_handler
+            (request_handler store failure_point)
+        in
+        let (`Initialized thread) = Paf.serve service http_server in
+        thread
 end
