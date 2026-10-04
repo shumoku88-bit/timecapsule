@@ -6,7 +6,7 @@ cd "$repo_root"
 
 port=18081
 base="http://127.0.0.1:$port"
-image="$repo_root/capsule-crash"
+image="$repo_root/capsule"
 log="$(mktemp)"
 state_file="$(mktemp)"
 release_output="$(mktemp)"
